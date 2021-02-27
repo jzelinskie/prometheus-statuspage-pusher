@@ -1,14 +1,11 @@
-FROM golang:1.10
-ENV IPATH=github.com/itskoko/prometheus-status-pusher
-RUN go get -u github.com/golang/dep/cmd/dep
-WORKDIR $GOPATH/src/$IPATH
+FROM golang:1.16-alpine3.13 AS build
 
-ADD Gopkg.* ./
-RUN dep ensure --vendor-only
+WORKDIR /go/src/app
+COPY . .
+RUN go get -d -v ./...
+RUN CGO_ENABLED=0 go install -v ./...
 
-ADD . .
-RUN go test ./... && CGO_ENABLED=0 go install ./...
+FROM alpine:3.13
 
-FROM busybox
-COPY --from=0 /go/bin/* /usr/local/bin/
-ENTRYPOINT [ "prometheus-status-pusher" ]
+COPY --from=build /go/bin/* /usr/local/bin/
+ENTRYPOINT ["prometheus-statuspage-pusher"]

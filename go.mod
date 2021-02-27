@@ -1,14 +1,12 @@
 module github.com/jzelinskie/prometheus-statuspage-pusher
 
-go 1.15
+go 1.16
 
 require (
 	github.com/ghodss/yaml v1.0.0
-	github.com/go-kit/kit v0.7.0
-	github.com/go-logfmt/logfmt v0.3.0 // indirect
-	github.com/go-stack/stack v1.7.0 // indirect
-	github.com/kr/logfmt v0.0.0-20140226030751-b84e30acd515 // indirect
-	github.com/prometheus/client_golang v0.9.0-pre1
-	github.com/prometheus/common v0.0.0-20180518154759-7600349dcfe1
-	gopkg.in/yaml.v2 v2.2.1 // indirect
+	github.com/prometheus/client_golang v1.9.0
+	github.com/prometheus/common v0.18.0
+	github.com/spf13/cobra v1.1.3
+	github.com/spf13/viper v1.7.1
+	go.uber.org/zap v1.16.0
 )
