@@ -1,5 +1,7 @@
 # prometheus-statuspage-pusher
 
+[![Docker Repository on Quay](https://quay.io/repository/jzelinskie/prometheus-statuspage-pusher/status "Docker Repository on Quay")](https://quay.io/repository/jzelinskie/prometheus-statuspage-pusher)
+
 A daemon that queries Prometheus on an interval and pushes values to [StatusPage](https://statuspage.io).
 
 - [YAML] configuration
