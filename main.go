@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"net/http/pprof"
 	"net/url"
 	"os"
 	"os/signal"
@@ -14,63 +15,75 @@ import (
 	"github.com/ghodss/yaml"
 	promapi "github.com/prometheus/client_golang/api"
 	promv1 "github.com/prometheus/client_golang/api/prometheus/v1"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	prommodel "github.com/prometheus/common/model"
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 	"github.com/spf13/viper"
 	"go.uber.org/zap"
 )
 
+func init() {
+	prometheus.MustRegister(pushCounter)
+}
+
+var pushCounter = prometheus.NewCounterVec(
+	prometheus.CounterOpts{
+		Name: "statuspage_pusher_pushes",
+		Help: "Responses for the various calls",
+	},
+	[]string{"metric_id", "response_code"},
+)
+
 var rootCmd = &cobra.Command{
-	Use: "prometheus-statuspage-pusher",
-	Run: rootRun,
+	Use:               "prometheus-statuspage-pusher",
+	PersistentPreRunE: func(cmd *cobra.Command, args []string) error { return initConfig(cmd) },
+	Run:               rootRun,
+}
+
+const envPrefix = "PROM_SP_PUSHER"
+
+func initConfig(cmd *cobra.Command) error {
+	v := viper.New()
+	viper.SetEnvPrefix(envPrefix)
+
+	cmd.Flags().VisitAll(func(f *pflag.Flag) {
+		envSuffix := strings.ToUpper(strings.ReplaceAll(f.Name, "-", "_"))
+		v.BindEnv(f.Name, envPrefix+"_"+envSuffix)
+
+		if !f.Changed && v.IsSet(f.Name) {
+			val := v.Get(f.Name)
+			cmd.Flags().Set(f.Name, fmt.Sprintf("%v", val))
+		}
+	})
+
+	return nil
 }
 
 func main() {
-	viper.SetDefault("PROM_ADDR", "http://127.0.0.1:9090")
-	viper.SetDefault("SP_DOMAIN", "https://api.statuspage.io")
-	viper.SetDefault("SP_PAGE_ID", "")
-	viper.SetDefault("SP_TOKEN", "")
-	viper.SetDefault("CONFIG", "queries.yaml")
-	viper.SetDefault("PUSH_INTERVAL", 30*time.Second)
-	viper.SetDefault("DEBUG", false)
-
-	rootCmd.Flags().String("prom-addr", viper.GetString("PROM_ADDR"), "address of the upstream gRPC service")
-	rootCmd.Flags().String("sp-domain", viper.GetString("SP_DOMAIN"), "root domain used for StatusPage API (default: https://api.statuspage.io)")
-
-	rootCmd.Flags().String("sp-page-id", viper.GetString("SP_PAGE_ID"), "StatusPage Page ID")
-	rootCmd.Flags().String("sp-token", viper.GetString("SP_TOKEN"), "StatusPage OAuth Token")
-	rootCmd.Flags().String("config", viper.GetString("CONFIG_PATH"), "local path the query config file")
-	rootCmd.Flags().Duration("push-interval", viper.GetDuration("PUSH_INTERVAL"), "frequency that metrics are pushed to StatusPage (default: 30s)")
-	rootCmd.Flags().Bool("debug", viper.GetBool("DEBUG"), "debug log verbosity")
-
-	viper.BindPFlag("PROM_ADDR", rootCmd.Flags().Lookup("prom-addr"))
-	viper.BindPFlag("SP_DOMAIN", rootCmd.Flags().Lookup("sp-url"))
-	viper.BindPFlag("SP_PAGE_ID", rootCmd.Flags().Lookup("sp-page-id"))
-	viper.BindPFlag("SP_TOKEN", rootCmd.Flags().Lookup("sp-token"))
-	viper.BindPFlag("CONFIG", rootCmd.Flags().Lookup("config"))
-	viper.BindPFlag("PUSH_INTERVAL", rootCmd.Flags().Lookup("push-interval"))
-	viper.BindPFlag("DEBUG", rootCmd.Flags().Lookup("debug"))
-
-	viper.SetEnvPrefix("PROM_SP_PUSHER")
-	viper.AutomaticEnv()
+	rootCmd.Flags().String("prom-url", "http://127.0.0.1:9090", "address of the upstream gRPC service (default: http://127.0.0.1:9090)")
+	rootCmd.Flags().String("sp-domain", "https://api.statuspage.io", "root domain used for StatusPage API (default: https://api.statuspage.io)")
+	rootCmd.Flags().String("sp-page-id", "", "StatusPage Page ID")
+	rootCmd.Flags().String("sp-token", "", "StatusPage OAuth Token")
+	rootCmd.Flags().String("config", "queries.yaml", "local path the query config file (default: ./queries.yaml)")
+	rootCmd.Flags().Duration("push-interval", 30*time.Second, "frequency that metrics are pushed to StatusPage (default: 30s)")
+	rootCmd.Flags().String("internal-metrics-addr", ":9090", "address that will serve prometheus and pprof data (default: :9090")
+	rootCmd.Flags().Bool("debug", false, "debug log verbosity (default: false)")
 
 	rootCmd.Execute()
 }
 
 func rootRun(cmd *cobra.Command, args []string) {
 	logger, _ := zap.NewProduction()
-	if viper.GetBool("debug") {
+	if MustGetBool(cmd, "debug") {
 		logger, _ = zap.NewDevelopment()
 	}
 	defer logger.Sync()
 
-	// TODO(jzelinskie): uncomment when this issue is resolved:
-	// https://github.com/spf13/viper/issues/695
-	// logger.Debug("parsed settings", zap.String("settings", fmt.Sprintf("%#v", viper.AllSettings())))
+	configmap := parseConfig(logger, MustGetString(cmd, "config"))
 
-	configmap := parseConfig(logger, viper.GetString("CONFIG"))
-
-	client, err := promapi.NewClient(promapi.Config{Address: viper.GetString("PROM_ADDR")})
+	client, err := promapi.NewClient(promapi.Config{Address: MustGetString(cmd, "prom-url")})
 	if err != nil {
 		logger.Fatal("failed to init prom client", zap.Error(err))
 	}
@@ -78,22 +91,45 @@ func rootRun(cmd *cobra.Command, args []string) {
 
 	signalctx, _ := signal.NotifyContext(context.Background(), os.Interrupt)
 
+	httpsrv := &http.Server{Addr: MustGetString(cmd, "internal-metrics-addr")}
+	go func() {
+		mux := http.NewServeMux()
+		mux.Handle("/metrics", promhttp.Handler())
+		mux.HandleFunc("/debug/pprof/", pprof.Index)
+		mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+		mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+		mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+		mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+		httpsrv.Handler = mux
+
+		if err := httpsrv.ListenAndServe(); err != http.ErrServerClosed {
+			logger.Fatal("failed while serving prometheus", zap.Error(err))
+		}
+	}()
+
+	domain := MustGetString(cmd, "sp-domain")
+	pageID := MustGetString(cmd, "sp-page-id")
+	token := MustGetString(cmd, "sp-token")
+
 	for {
 		select {
-		case <-time.After(viper.GetDuration("PUSH_INTERVAL")):
+		case <-time.After(MustGetDuration(cmd, "push-interval")):
 			now := time.Now()
 			for metricID, query := range configmap {
 				value := queryProm(logger, api, query, now)
-				pushValueToStatusPage(logger, metricID, value, now)
+				pushValueToStatusPage(logger, domain, token, pageID, metricID, value, now)
 			}
 		case <-signalctx.Done():
+			if err := httpsrv.Close(); err != nil {
+				logger.Fatal("failed while shutting down metrics server", zap.Error(err))
+			}
 			return
 		}
 	}
 }
 
 func parseConfig(logger *zap.Logger, path string) map[string]string {
-	contents, err := os.ReadFile(viper.GetString("CONFIG"))
+	contents, err := os.ReadFile(path)
 	if err != nil {
 		logger.Fatal("failed to read config file", zap.Error(err))
 	}
@@ -124,10 +160,11 @@ func queryProm(logger *zap.Logger, api promv1.API, query string, now time.Time) 
 	return float64(vec[0].Value)
 }
 
-func pushValueToStatusPage(logger *zap.Logger, metricID string, value float64, now time.Time) {
-	requestURL := viper.GetString("SP_DOMAIN") + fmt.Sprintf(
-		"/v1/pages/%s/metrics/%s/data.json",
-		viper.GetString("SP_PAGE_ID"),
+func pushValueToStatusPage(logger *zap.Logger, domain, token, pageID, metricID string, value float64, now time.Time) {
+	requestURL := fmt.Sprintf(
+		"%s/v1/pages/%s/metrics/%s/data.json",
+		domain,
+		pageID,
 		metricID,
 	)
 
@@ -140,17 +177,44 @@ func pushValueToStatusPage(logger *zap.Logger, metricID string, value float64, n
 	if err != nil {
 		logger.Fatal("failed to create request", zap.Error(err))
 	}
-	req.Header.Set("Authorization", "OAuth "+viper.GetString("SP_TOKEN"))
+	req.Header.Set("Authorization", "OAuth "+token)
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
+		// Debatable whether or not this should be fatal.
 		logger.Warn("failed calling StatusPage API", zap.Error(err))
 		return
 	}
 	defer resp.Body.Close()
 
+	pushCounter.WithLabelValues(metricID, resp.Status).Add(1)
+
 	if resp.StatusCode/100 != 2 {
 		logger.Warn("non-2xx response from StatusPage API", zap.Int("status code", resp.StatusCode))
 	}
+}
+
+func MustGetDuration(cmd *cobra.Command, key string) time.Duration {
+	val, err := cmd.Flags().GetDuration(key)
+	if err != nil {
+		panic(fmt.Sprintf("failed to find flag %s: %s", key, err))
+	}
+	return val
+}
+
+func MustGetBool(cmd *cobra.Command, key string) bool {
+	val, err := cmd.Flags().GetBool(key)
+	if err != nil {
+		panic(fmt.Sprintf("failed to find flag %s: %s", key, err))
+	}
+	return val
+}
+
+func MustGetString(cmd *cobra.Command, key string) string {
+	val, err := cmd.Flags().GetString(key)
+	if err != nil {
+		panic(fmt.Sprintf("failed to find flag %s: %s", key, err))
+	}
+	return os.ExpandEnv(val)
 }
