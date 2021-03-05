@@ -13,14 +13,13 @@ import (
 	"time"
 
 	"github.com/ghodss/yaml"
+	"github.com/jzelinskie/cobrautil"
 	promapi "github.com/prometheus/client_golang/api"
 	promv1 "github.com/prometheus/client_golang/api/prometheus/v1"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	prommodel "github.com/prometheus/common/model"
 	"github.com/spf13/cobra"
-	"github.com/spf13/pflag"
-	"github.com/spf13/viper"
 	"go.uber.org/zap"
 )
 
@@ -36,32 +35,13 @@ var pushCounter = prometheus.NewCounterVec(
 	[]string{"metric_id", "response_code"},
 )
 
-var rootCmd = &cobra.Command{
-	Use:               "prometheus-statuspage-pusher",
-	PersistentPreRunE: func(cmd *cobra.Command, args []string) error { return initConfig(cmd) },
-	Run:               rootRun,
-}
-
-const envPrefix = "PROM_SP_PUSHER"
-
-func initConfig(cmd *cobra.Command) error {
-	v := viper.New()
-	viper.SetEnvPrefix(envPrefix)
-
-	cmd.Flags().VisitAll(func(f *pflag.Flag) {
-		envSuffix := strings.ToUpper(strings.ReplaceAll(f.Name, "-", "_"))
-		v.BindEnv(f.Name, envPrefix+"_"+envSuffix)
-
-		if !f.Changed && v.IsSet(f.Name) {
-			val := v.Get(f.Name)
-			cmd.Flags().Set(f.Name, fmt.Sprintf("%v", val))
-		}
-	})
-
-	return nil
-}
-
 func main() {
+	var rootCmd = &cobra.Command{
+		Use:               "prometheus-statuspage-pusher",
+		PersistentPreRunE: cobrautil.SyncViperPreRunE("PROM_SP_PUSHER"),
+		Run:               rootRun,
+	}
+
 	rootCmd.Flags().String("prom-url", "http://127.0.0.1:9090", "address of the upstream gRPC service (default: http://127.0.0.1:9090)")
 	rootCmd.Flags().String("sp-domain", "https://api.statuspage.io", "root domain used for StatusPage API (default: https://api.statuspage.io)")
 	rootCmd.Flags().String("sp-page-id", "", "StatusPage Page ID")
@@ -76,14 +56,14 @@ func main() {
 
 func rootRun(cmd *cobra.Command, args []string) {
 	logger, _ := zap.NewProduction()
-	if MustGetBool(cmd, "debug") {
+	if cobrautil.MustGetBool(cmd, "debug") {
 		logger, _ = zap.NewDevelopment()
 	}
 	defer logger.Sync()
 
-	configmap := parseConfig(logger, MustGetString(cmd, "config"))
+	configmap := parseConfig(logger, cobrautil.MustGetStringExpanded(cmd, "config"))
 
-	client, err := promapi.NewClient(promapi.Config{Address: MustGetString(cmd, "prom-url")})
+	client, err := promapi.NewClient(promapi.Config{Address: cobrautil.MustGetString(cmd, "prom-url")})
 	if err != nil {
 		logger.Fatal("failed to init prom client", zap.Error(err))
 	}
@@ -91,7 +71,7 @@ func rootRun(cmd *cobra.Command, args []string) {
 
 	signalctx, _ := signal.NotifyContext(context.Background(), os.Interrupt)
 
-	httpsrv := &http.Server{Addr: MustGetString(cmd, "internal-metrics-addr")}
+	httpsrv := &http.Server{Addr: cobrautil.MustGetString(cmd, "internal-metrics-addr")}
 	go func() {
 		mux := http.NewServeMux()
 		mux.Handle("/metrics", promhttp.Handler())
@@ -107,13 +87,13 @@ func rootRun(cmd *cobra.Command, args []string) {
 		}
 	}()
 
-	domain := MustGetString(cmd, "sp-domain")
-	pageID := MustGetString(cmd, "sp-page-id")
-	token := MustGetString(cmd, "sp-token")
+	domain := cobrautil.MustGetString(cmd, "sp-domain")
+	pageID := cobrautil.MustGetString(cmd, "sp-page-id")
+	token := cobrautil.MustGetString(cmd, "sp-token")
 
 	for {
 		select {
-		case <-time.After(MustGetDuration(cmd, "push-interval")):
+		case <-time.After(cobrautil.MustGetDuration(cmd, "push-interval")):
 			now := time.Now()
 			for metricID, query := range configmap {
 				value := queryProm(logger, api, query, now)
@@ -193,28 +173,4 @@ func pushValueToStatusPage(logger *zap.Logger, domain, token, pageID, metricID s
 	if resp.StatusCode/100 != 2 {
 		logger.Warn("non-2xx response from StatusPage API", zap.Int("status code", resp.StatusCode))
 	}
-}
-
-func MustGetDuration(cmd *cobra.Command, key string) time.Duration {
-	val, err := cmd.Flags().GetDuration(key)
-	if err != nil {
-		panic(fmt.Sprintf("failed to find flag %s: %s", key, err))
-	}
-	return val
-}
-
-func MustGetBool(cmd *cobra.Command, key string) bool {
-	val, err := cmd.Flags().GetBool(key)
-	if err != nil {
-		panic(fmt.Sprintf("failed to find flag %s: %s", key, err))
-	}
-	return val
-}
-
-func MustGetString(cmd *cobra.Command, key string) string {
-	val, err := cmd.Flags().GetString(key)
-	if err != nil {
-		panic(fmt.Sprintf("failed to find flag %s: %s", key, err))
-	}
-	return os.ExpandEnv(val)
 }
