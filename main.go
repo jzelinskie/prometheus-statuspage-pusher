@@ -12,22 +12,21 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cenkalti/backoff/v4"
 	"github.com/ghodss/yaml"
 	"github.com/jzelinskie/cobrautil"
 	promapi "github.com/prometheus/client_golang/api"
 	promv1 "github.com/prometheus/client_golang/api/prometheus/v1"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	prommodel "github.com/prometheus/common/model"
+	"github.com/rs/zerolog"
+	"github.com/rs/zerolog/log"
 	"github.com/spf13/cobra"
-	"go.uber.org/zap"
 )
 
-func init() {
-	prometheus.MustRegister(pushCounter)
-}
-
-var pushCounter = prometheus.NewCounterVec(
+var pushCounter = promauto.NewCounterVec(
 	prometheus.CounterOpts{
 		Name: "statuspage_pusher_pushes",
 		Help: "Responses for the various calls",
@@ -55,17 +54,20 @@ func main() {
 }
 
 func rootRun(cmd *cobra.Command, args []string) {
-	logger, _ := zap.NewProduction()
+	zerolog.SetGlobalLevel(zerolog.InfoLevel)
 	if cobrautil.MustGetBool(cmd, "debug") {
-		logger, _ = zap.NewDevelopment()
+		zerolog.SetGlobalLevel(zerolog.TraceLevel)
+		log.Info().Str("new level", "trace").Msg("set log level")
 	}
-	defer logger.Sync()
 
-	configmap := parseConfig(logger, cobrautil.MustGetStringExpanded(cmd, "config"))
+	configmap, err := parseConfig(cobrautil.MustGetStringExpanded(cmd, "config"))
+	if err != nil {
+		log.Fatal().Err(err).Msg("failed to parse config")
+	}
 
 	client, err := promapi.NewClient(promapi.Config{Address: cobrautil.MustGetString(cmd, "prom-url")})
 	if err != nil {
-		logger.Fatal("failed to init prom client", zap.Error(err))
+		log.Fatal().Err(err).Msg("failed to init prom client")
 	}
 	api := promv1.NewAPI(client)
 
@@ -82,8 +84,9 @@ func rootRun(cmd *cobra.Command, args []string) {
 		mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
 		httpsrv.Handler = mux
 
+		log.Info().Str("addr", httpsrv.Addr).Msg("metrics and pprof server listening")
 		if err := httpsrv.ListenAndServe(); err != http.ErrServerClosed {
-			logger.Fatal("failed while serving prometheus", zap.Error(err))
+			log.Fatal().Err(err).Msg("failed while serving prometheus")
 		}
 	}()
 
@@ -91,56 +94,67 @@ func rootRun(cmd *cobra.Command, args []string) {
 	pageID := cobrautil.MustGetString(cmd, "sp-page-id")
 	token := cobrautil.MustGetString(cmd, "sp-token")
 
+	backoffInterval := backoff.NewExponentialBackOff()
+	backoffInterval.InitialInterval = cobrautil.MustGetDuration(cmd, "push-interval")
+	ticker := time.After(backoffInterval.InitialInterval)
+
+	log.Info().Dur("interval", backoffInterval.InitialInterval).Msg("began pushing metrics")
 	for {
 		select {
-		case <-time.After(cobrautil.MustGetDuration(cmd, "push-interval")):
+		case <-ticker:
 			now := time.Now()
 			for metricID, query := range configmap {
-				value := queryProm(logger, api, query, now)
-				pushValueToStatusPage(logger, domain, token, pageID, metricID, value, now)
+				value, err := queryProm(api, query, now)
+				if err != nil {
+					log.Fatal().Err(err).Msg("failed to query prometheus")
+				}
+
+				nextPush := backoffInterval.InitialInterval
+				if pushValueToStatusPage(domain, token, pageID, metricID, value, now) {
+					nextPush = backoffInterval.NextBackOff()
+				} else {
+					backoffInterval.Reset()
+				}
+				ticker = time.After(nextPush)
 			}
 		case <-signalctx.Done():
 			if err := httpsrv.Close(); err != nil {
-				logger.Fatal("failed while shutting down metrics server", zap.Error(err))
+				log.Fatal().Err(err).Msg("failed while shutting down metrics server")
 			}
 			return
 		}
 	}
 }
 
-func parseConfig(logger *zap.Logger, path string) map[string]string {
+func parseConfig(path string) (map[string]string, error) {
 	contents, err := os.ReadFile(path)
 	if err != nil {
-		logger.Fatal("failed to read config file", zap.Error(err))
+		return nil, fmt.Errorf("failed to read config file: %w", err)
 	}
 
 	configmap := make(map[string]string)
 	if err := yaml.Unmarshal(contents, &configmap); err != nil {
-		logger.Fatal("failed to parse config file", zap.Error(err))
+		return nil, fmt.Errorf("failed to parse config file: %w", err)
 	}
 
-	return configmap
+	return configmap, nil
 }
 
-func queryProm(logger *zap.Logger, api promv1.API, query string, now time.Time) float64 {
+func queryProm(api promv1.API, query string, now time.Time) (float64, error) {
 	resp, _, err := api.Query(context.Background(), query, now)
 	if err != nil {
-		logger.Fatal("failed to query prometheus", zap.Error(err))
+		return 0, fmt.Errorf("failed to query prometheus: %w", err)
 	}
 
 	vec := resp.(prommodel.Vector)
 	if l := vec.Len(); l != 1 {
-		logger.Fatal(
-			"expected query to return a single value",
-			zap.String("query", query),
-			zap.Int("vector size", l),
-		)
+		return 0, fmt.Errorf("expected query to return a single value")
 	}
 
-	return float64(vec[0].Value)
+	return float64(vec[0].Value), nil
 }
 
-func pushValueToStatusPage(logger *zap.Logger, domain, token, pageID, metricID string, value float64, now time.Time) {
+func pushValueToStatusPage(domain, token, pageID, metricID string, value float64, now time.Time) (backoff bool) {
 	requestURL := fmt.Sprintf(
 		"%s/v1/pages/%s/metrics/%s/data.json",
 		domain,
@@ -155,7 +169,7 @@ func pushValueToStatusPage(logger *zap.Logger, domain, token, pageID, metricID s
 
 	req, err := http.NewRequest("POST", requestURL, strings.NewReader(urlValues.Encode()))
 	if err != nil {
-		logger.Fatal("failed to create request", zap.Error(err))
+		log.Fatal().Err(err).Msg("failed to create request")
 	}
 	req.Header.Set("Authorization", "OAuth "+token)
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
@@ -163,14 +177,17 @@ func pushValueToStatusPage(logger *zap.Logger, domain, token, pageID, metricID s
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		// Debatable whether or not this should be fatal.
-		logger.Warn("failed calling StatusPage API", zap.Error(err))
-		return
+		log.Warn().Err(err).Msg("failed calling StatusPage API")
+		return true
 	}
 	defer resp.Body.Close()
 
 	pushCounter.WithLabelValues(metricID, resp.Status).Add(1)
 
 	if resp.StatusCode/100 != 2 {
-		logger.Warn("non-2xx response from StatusPage API", zap.Int("status code", resp.StatusCode))
+		log.Warn().Int("status code", resp.StatusCode).Str("metric", metricID).Msg("non-2xx response from StatusPage API")
+		return true
 	}
+	log.Info().Int("status code", resp.StatusCode).Str("metric", metricID).Msg("2xx response from StatusPage API")
+	return false
 }
