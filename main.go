@@ -21,7 +21,6 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	prommodel "github.com/prometheus/common/model"
-	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 	"github.com/spf13/cobra"
 )
@@ -36,9 +35,12 @@ var pushCounter = promauto.NewCounterVec(
 
 func main() {
 	var rootCmd = &cobra.Command{
-		Use:               "prometheus-statuspage-pusher",
-		PersistentPreRunE: cobrautil.SyncViperPreRunE("PROM_SP_PUSHER"),
-		Run:               rootRun,
+		Use: "prometheus-statuspage-pusher",
+		PersistentPreRunE: cobrautil.CommandStack(
+			cobrautil.SyncViperPreRunE("PROM_SP_PUSHER"),
+			cobrautil.ZeroLogPreRunE,
+		),
+		Run: rootRun,
 	}
 
 	rootCmd.Flags().String("prom-url", "http://127.0.0.1:9090", "address of the upstream gRPC service (default: http://127.0.0.1:9090)")
@@ -48,18 +50,12 @@ func main() {
 	rootCmd.Flags().String("config", "queries.yaml", "local path the query config file (default: ./queries.yaml)")
 	rootCmd.Flags().Duration("push-interval", 30*time.Second, "frequency that metrics are pushed to StatusPage (default: 30s)")
 	rootCmd.Flags().String("internal-metrics-addr", ":9090", "address that will serve prometheus and pprof data (default: :9090")
-	rootCmd.Flags().Bool("debug", false, "debug log verbosity (default: false)")
+	cobrautil.RegisterZeroLogFlags(rootCmd.Flags())
 
 	rootCmd.Execute()
 }
 
 func rootRun(cmd *cobra.Command, args []string) {
-	zerolog.SetGlobalLevel(zerolog.InfoLevel)
-	if cobrautil.MustGetBool(cmd, "debug") {
-		zerolog.SetGlobalLevel(zerolog.TraceLevel)
-		log.Info().Str("new level", "trace").Msg("set log level")
-	}
-
 	configmap, err := parseConfig(cobrautil.MustGetStringExpanded(cmd, "config"))
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to parse config")
